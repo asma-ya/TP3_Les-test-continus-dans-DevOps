@@ -1,13 +1,18 @@
+
 """Small authentication module used for the DevOps TP N°3."""
 from __future__ import annotations
 
+import hashlib
+import hmac
+import secrets
 import time
 from typing import Any
 
 MAX_ATTEMPTS = 3
 LOCKOUT_SECONDS = 300
+HASH_ITERATIONS = 200_000
 
-# username -> stored password value
+# username -> hashed password
 users: dict[str, str] = {}
 
 # username -> number of consecutive failed attempts
@@ -32,18 +37,44 @@ def _valid_password(password: Any) -> bool:
 
 
 def _hash_password(password: str) -> str:
-    """Prepare the password for storage (simplified version)."""
-    return password
+    """Hash a password using PBKDF2 with a random salt."""
+    salt = secrets.token_hex(16)
+    password_hash = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt.encode("utf-8"),
+        HASH_ITERATIONS,
+    ).hex()
+
+    return f"pbkdf2_sha256${HASH_ITERATIONS}${salt}${password_hash}"
 
 
 def _verify_password(password: str, encoded_hash: str) -> bool:
-    return password == encoded_hash
+    """Verify a password against its stored hash."""
+    try:
+        algorithm, iterations, salt, expected_hash = encoded_hash.split("$")
+
+        if algorithm != "pbkdf2_sha256":
+            return False
+
+        actual_hash = hashlib.pbkdf2_hmac(
+            "sha256",
+            password.encode("utf-8"),
+            salt.encode("utf-8"),
+            int(iterations),
+        ).hex()
+
+        return hmac.compare_digest(actual_hash, expected_hash)
+
+    except (ValueError, TypeError):
+        return False
 
 
 def register_user(username: Any, password: Any) -> bool:
     """Register a user. Return False for invalid or duplicate credentials."""
     if not _valid_username(username) or not _valid_password(password):
         return False
+
     if username in users:
         return False
 
@@ -55,41 +86,53 @@ def register_user(username: Any, password: Any) -> bool:
 
 def authenticate(username: Any, password: Any) -> dict[str, Any]:
     """Authenticate a user and return a result dictionary."""
-    # Reject malformed input.
     if not _valid_username(username) or not isinstance(password, str):
         return {"success": False, "message": GENERIC_ERROR}
 
     now = time.time()
-    if blocked_until.get(username, 0) > now:
-        return {"success": False, "message": GENERIC_ERROR}
+
+    # Check whether the account is locked.
+    lock_expiry = blocked_until.get(username)
+
+    if lock_expiry is not None:
+        if lock_expiry > now:
+            return {"success": False, "message": GENERIC_ERROR}
+
+        # Lockout expired: start a new attempt counter.
+        blocked_until.pop(username, None)
+        attempts.pop(username, None)
 
     encoded_hash = users.get(username)
 
+    # Use the same message for unknown users and wrong passwords.
     if encoded_hash is None:
-        return {"success": False, "message": "Utilisateur inconnu"}
+        return {"success": False, "message": GENERIC_ERROR}
 
     if not _verify_password(password, encoded_hash):
         _record_failure(username, now)
         return {"success": False, "message": GENERIC_ERROR}
 
+    # Successful login resets failed attempts.
     attempts.pop(username, None)
     blocked_until.pop(username, None)
+
     return {"success": True, "message": "Connexion reussie"}
 
 
 def _record_failure(username: str, now: float) -> None:
     attempts[username] = attempts.get(username, 0) + 1
-    if attempts[username] > MAX_ATTEMPTS:
+
+    if attempts[username] >= MAX_ATTEMPTS:
         blocked_until[username] = now + LOCKOUT_SECONDS
 
 
 def reset_attempts() -> None:
-    """Clear lockout state. Intended for tests and controlled administration."""
+    """Clear lockout state."""
     attempts.clear()
     blocked_until.clear()
 
 
 def reset_state() -> None:
-    """Clear all in-memory state. Intended for isolated automated tests."""
+    """Clear all in-memory state for isolated tests."""
     users.clear()
     reset_attempts()
